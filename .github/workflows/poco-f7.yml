@@ -7,8 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       march:
+        # SM8735 firmware disables SVE/SVE2 (absent from /proc/cpuinfo Features); armv9 implies
+        # SVE2 and clang auto-vectorizes with it, which SIGILLs on load. Keep +nosve.
         description: -march for the native core
-        default: armv9.2-a
+        default: armv9.2-a+nosve
       mtune:
         description: -mtune for the native core (empty = none)
         default: cortex-a720
