@@ -1,0 +1,103 @@
+name: Poco F7 APK
+
+# Device-specific ARMSX2 build for the Poco F7 (SM8735: Cortex-X4 + Cortex-A720, Adreno 825,
+# 4 KiB pages). Installs beside the stock app as com.armsx2.f7 and is profileable from adb shell.
+
+on:
+  workflow_dispatch:
+    inputs:
+      march:
+        description: -march for the native core
+        default: armv9.2-a
+      mtune:
+        description: -mtune for the native core (empty = none)
+        default: cortex-a720
+      pgo:
+        description: Use the upstream PGO profile
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: platforms/android
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install NDK + CMake
+        run: yes | sdkmanager "ndk;29.0.14206865" "cmake;3.31.6" >/dev/null || true
+
+      - name: Fetch shaderc third-party deps
+        run: python3 app/src/main/cpp/3rdparty/shaderc/utils/git-sync-deps
+
+      - name: Install Rust Android target
+        run: rustup target add aarch64-linux-android
+
+      - name: Signing config
+        env:
+          KS_B64: ${{ secrets.F7_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.F7_KEYSTORE_PASS }}
+        run: |
+          test -n "$KS_B64" || { echo "F7_KEYSTORE_B64 secret missing"; exit 1; }
+          printf '%s' "$KS_B64" | base64 -d > f7.jks
+          cat > armsx2_keystore.properties <<EOF
+          storeFile=f7.jks
+          storePassword=$KS_PASS
+          keyAlias=f7
+          keyPassword=$KS_PASS
+          EOF
+
+      - name: Build APK
+        run: |
+          MTUNE="${{ inputs.mtune }}"
+          PGO_ARGS=(-Parmsx2.pgo=none)
+          if [ "${{ inputs.pgo }}" = "true" ]; then
+            PGO_ARGS=(-Parmsx2.pgo=optimize -Parmsx2.pgoProfile="$PWD/pgo/armsx2.profdata")
+          fi
+          ./gradlew :app:assembleGithubRelease --no-daemon \
+            -Parmsx2.applicationId=com.armsx2.f7 \
+            -Parmsx2.appLabel="ARMSX2 F7" \
+            -Parmsx2.channel=f7 \
+            -Parmsx2.versionCode=$((900000 + ${{ github.run_number }})) \
+            -Parmsx2.versionName="f7-${{ github.run_number }}-$(git rev-parse --short HEAD)" \
+            -Parmsx2.hostPageSize=0x1000 \
+            -Parmsx2.minSdk=33 \
+            -Parmsx2.march="${{ inputs.march }}" \
+            ${MTUNE:+-Parmsx2.marchExtra=-mtune=$MTUNE} \
+            "${PGO_ARGS[@]}"
+
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/github/release/*.apk out/
+          cd out
+          for f in *.apk; do mv "$f" "ARMSX2-F7-${{ github.run_number }}.apk"; done
+          sha256sum *.apk | tee SHA256SUMS
+          {
+            echo "march=${{ inputs.march }} mtune=${{ inputs.mtune }} pgo=${{ inputs.pgo }}"
+            echo "commit=$(git rev-parse HEAD)"
+          } > BUILDINFO
+          cat BUILDINFO >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: armsx2-f7-${{ github.run_number }}
+          path: platforms/android/out/
+          if-no-files-found: error
