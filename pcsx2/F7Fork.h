@@ -7,6 +7,7 @@
 // in one header so the fork's diff against upstream stays small and easy to rebase:
 //   F7Prof   (P1) always-on wait counters for the GS front (MTGS) and GS Back threads, printed
 //                 every ~5 s as one console line starting with "F7PROF" (PerformanceMetrics.cpp).
+//   F7Tuning (P6) the 12 GB RAM gate for the larger GS texture pool and hash cache.
 // The prime-core placement (P2, affinity mode 8) lives entirely in VMManager.cpp.
 
 #include "common/HostSys.h"
@@ -112,3 +113,22 @@ namespace F7Prof
 		g_front.full[static_cast<size_t>(why)].Add(dt);
 	}
 } // namespace F7Prof
+
+namespace F7Tuning
+{
+	/// 12 GB phones report about 10.9-11.2 GiB through sysconf (the kernel and firmware carve-outs
+	/// keep the rest; the Poco F7 reads 10.97 GiB), 8 GB ones about 7.2-7.6 GiB, so 10 GiB tells
+	/// the two classes apart. Swap (HyperOS "memory extension") is not physical memory and is not
+	/// counted by sysconf either.
+	inline constexpr u64 BIG_RAM_BYTES = 10ull * 1024 * 1024 * 1024;
+
+	/// GSTextureCache::AgeHashCache limits on such devices (upstream: 800 entries, 30 frames).
+	inline constexpr u32 HASH_CACHE_SIZE = 1600;
+	inline constexpr u32 HASH_CACHE_AGE = 60;
+
+	inline bool HasBigRam()
+	{
+		static const bool big = (GetPhysicalMemory() >= BIG_RAM_BYTES);
+		return big;
+	}
+} // namespace F7Tuning

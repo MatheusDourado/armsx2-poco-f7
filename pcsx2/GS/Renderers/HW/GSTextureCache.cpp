@@ -9,6 +9,7 @@
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
 #include "GS/GSXXH.h"
+#include "F7Fork.h"
 
 #include "common/Console.h"
 #include "common/BitUtils.h"
@@ -7636,8 +7637,25 @@ void GSTextureCache::AgeHashCache()
 	// A game called Corvette draws its background FMVs with a ton of 17x17 tiles, which ends up
 	// being about 600 texture uploads per frame. We'll use 800 as an upper bound for a bit of
 	// a buffer, hopefully nothing's going to end up with more textures than that.
+#if defined(__ANDROID__)
+	// F7 fork (P6): on a 12 GB device keep twice the entries for twice as long (1600 / 60), so a
+	// texture that leaves and comes back within two seconds is not hashed and uploaded again.
+	static const bool s_f7_big_hash_cache = []() {
+		const bool big = F7Tuning::HasBigRam();
+		if (big)
+		{
+			Console.WriteLn("F7TUNE: hash cache %u entries / %u frames (upstream 800 / 30), %.2f GiB RAM.",
+				F7Tuning::HASH_CACHE_SIZE, F7Tuning::HASH_CACHE_AGE,
+				static_cast<double>(GetPhysicalMemory()) / (1024.0 * 1024.0 * 1024.0));
+		}
+		return big;
+	}();
+	const u32 MAX_HASH_CACHE_SIZE = s_f7_big_hash_cache ? F7Tuning::HASH_CACHE_SIZE : 800;
+	const u32 MAX_HASH_CACHE_AGE = s_f7_big_hash_cache ? F7Tuning::HASH_CACHE_AGE : 30;
+#else
 	constexpr u32 MAX_HASH_CACHE_SIZE = 800;
 	constexpr u32 MAX_HASH_CACHE_AGE = 30;
+#endif
 
 	bool might_need_cache_purge = (m_hash_cache.size() > MAX_HASH_CACHE_SIZE);
 	if (might_need_cache_purge)

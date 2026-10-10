@@ -3902,7 +3902,28 @@ void GSDeviceVK::PublishGPUProfile()
 	SetRuntimeGPUProfile(mobile_profile.runtime_profile);
 	// Per-model pool sizes and ages, which drive GSDevice's pool sizing. From sashkinbro/EmuCoreX.
 	SetMobileGPUIdentity(mobile_profile.gpu);
-	SetMobileGSTuning(mobile_profile.gs_tuning);
+	MobileGsTuning gs_tuning = mobile_profile.gs_tuning;
+	// F7 fork (P6): the per-model table sizes the Adreno 825 pool at 148 targets / 148 textures
+	// with ages 10/8 (GSGPUProfileAdreno.cpp), whatever the RAM. When FetchSurface finds the pool
+	// at that limit it hands back a texture already used this frame, and an upload into it ends
+	// the render pass. With 12 GB of RAM (the GPU's memory too) the pool can afford twice the
+	// count, capped at the desktop limits (300), and the desktop ages (20/10).
+	if (mobile_profile.gpu.architecture == MobileGpuArchitecture::Adreno8xx && F7Tuning::HasBigRam())
+	{
+		const MobileGsTuning base = gs_tuning;
+		gs_tuning.pooled_targets = std::min<u32>(base.pooled_targets * 2, MAX_POOLED_TARGETS);
+		gs_tuning.pooled_textures = std::min<u32>(base.pooled_textures * 2, MAX_POOLED_TEXTURES);
+		gs_tuning.target_age = std::max<u32>(base.target_age, MAX_TARGET_AGE);
+		gs_tuning.texture_age = std::max<u32>(base.texture_age, MAX_TEXTURE_AGE);
+		gs_tuning.constrained = (gs_tuning.pooled_targets < 128 || gs_tuning.pooled_textures < 128);
+		Console.WriteLn("F7TUNE: Adreno %u, %.2f GiB RAM: texture pool targets %u->%u (age %u->%u), "
+						"textures %u->%u (age %u->%u).",
+			static_cast<unsigned>(mobile_profile.gpu.model_number),
+			static_cast<double>(GetPhysicalMemory()) / (1024.0 * 1024.0 * 1024.0),
+			base.pooled_targets, gs_tuning.pooled_targets, base.target_age, gs_tuning.target_age,
+			base.pooled_textures, gs_tuning.pooled_textures, base.texture_age, gs_tuning.texture_age);
+	}
+	SetMobileGSTuning(gs_tuning);
 
 	// Hand the resolved architecture to frame generation, which needs Adreno 7xx or newer, or a
 	// 6xx on Turnip. Done here rather than asked for on demand so the settings screen can still
