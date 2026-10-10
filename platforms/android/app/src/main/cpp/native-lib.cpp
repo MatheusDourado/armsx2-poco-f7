@@ -3245,14 +3245,16 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setAutoRendererGpuStrings(
 }
 
 // Affinity Control Mode (VMManager.cpp). 0 = Disabled/scheduler-decides, 1-6 = explicit
-// EE/VU/GS priority orders, 7 = Performance Cores (the default). Out-of-range values fall back
+// EE/VU/GS priority orders, 7 = Performance Cores (the default), 8 = Performance Cores plus one
+// thread alone on the prime core (Poco F7 fork; usually reached through the debug.armsx2.f7.prime
+// property, which promotes 7 to 8). Out-of-range values fall back
 // to 0 rather than the default: a bad value means a bug upstream, so do the least. Read by SetEmuThreadAffinities when the VM
 // boots, so the app sets it before runVMThread; changing it takes effect on the next boot.
 extern int g_android_affinity_mode;
 extern "C"
 JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_setAffinityMode(JNIEnv*, jclass, jint mode) {
-    g_android_affinity_mode = (mode < 0 || mode > 7) ? 0 : static_cast<int>(mode);
+    g_android_affinity_mode = (mode < 0 || mode > 8) ? 0 : static_cast<int>(mode);
 }
 
 extern "C"

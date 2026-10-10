@@ -89,6 +89,13 @@
 #include <unistd.h>
 #endif
 
+#if defined(__ANDROID__)
+// Poco F7 fork (P2): debug.armsx2.f7.prime selects the thread affinity mode 8 puts on the prime core.
+#include <optional>
+#include <string_view>
+#include <sys/system_properties.h>
+#endif
+
 #ifdef _WIN32
 #include "common/RedtapeWindows.h"
 #include <objbase.h>
@@ -4792,10 +4799,155 @@ u64 VMManager::Internal::PlaceGSBackThreadNearGSThread()
 // boots (see SetEmuThreadAffinities below for the semantics of each value):
 //   0 Disabled (default — scheduler decides)   1 EE>VU>GS   2 EE>GS>VU   3 VU>EE>GS
 //   4 VU>GS>EE   5 GS>EE>VU   6 GS>VU>EE       7 Performance Cores
+//   8 Performance Cores + one thread alone on the prime core (Poco F7 fork, see below)
 // A plain int like g_gs_android_prefer_vk: written once at startup/boot, read on the CPU thread.
 // Default 7 = Performance Cores; see the Kotlin Settings.affinityMode doc. The app pushes
 // the user's value before runVMThread, so this only applies if that push never happened.
 int g_android_affinity_mode = 7;
+
+// ---- Poco F7 fork (P2): affinity mode 8 -------------------------------------------------------
+// Mode 8 keeps mode 7's confinement of EE, GS (MTGS), VU (MTVU) and GS Back to the performance
+// tier, then pins ONE of them alone to the highest-capacity core and removes that core from the
+// others' masks. On SM8735 the chosen thread gets cpu7 (Cortex-X4, cpu_capacity 1024) and the
+// rest share cpu2-6 (Cortex-A720, 852/792); cpu0-1 (569) stay out, as in mode 7. Mode 7 leaves
+// the X4 to EAS, which can give it to a thread that is mostly spinning (MTGS waiting on VU1).
+//
+// The thread comes from the system property debug.armsx2.f7.prime = ee | gs | gsback | vu, read
+// at every placement (VM boot), so `adb shell setprop` plus a game restart changes it, no rebuild:
+//   - set to a thread name: a mode-7 placement (the app default) is promoted to mode 8;
+//   - unset/empty: mode 7 stays mode 7, and an explicit mode 8 (JNI value 8) uses gsback;
+//   - anything else ("off"): no promotion, and an explicit mode 8 places as mode 7.
+// Every decision is logged with the prefix "F7AFF".
+enum class F7PrimeThread
+{
+	EE,
+	GS,
+	GSBack,
+	VU,
+};
+
+static const char* F7PrimeThreadName(F7PrimeThread who)
+{
+	switch (who)
+	{
+		case F7PrimeThread::EE:
+			return "ee";
+		case F7PrimeThread::GS:
+			return "gs";
+		case F7PrimeThread::GSBack:
+			return "gsback";
+		case F7PrimeThread::VU:
+			return "vu";
+	}
+	return "?";
+}
+
+/// The mode to place with, after the property; for mode 8, *who is the thread for the prime core.
+static int F7ResolveAffinityMode(int app_mode, F7PrimeThread* who)
+{
+	char value[PROP_VALUE_MAX] = {};
+	__system_property_get("debug.armsx2.f7.prime", value);
+	const std::string_view prop(value);
+
+	std::optional<F7PrimeThread> named;
+	if (prop == "ee")
+		named = F7PrimeThread::EE;
+	else if (prop == "gs")
+		named = F7PrimeThread::GS;
+	else if (prop == "gsback")
+		named = F7PrimeThread::GSBack;
+	else if (prop == "vu")
+		named = F7PrimeThread::VU;
+
+	int mode = app_mode;
+	if (named.has_value() && app_mode == 7)
+		mode = 8;
+	else if (app_mode == 8 && !named.has_value() && !prop.empty())
+		mode = 7;
+	*who = named.value_or(F7PrimeThread::GSBack);
+
+	INFO_LOG("F7AFF: app affinity mode {}, debug.armsx2.f7.prime='{}' -> mode {}{}{}", app_mode, prop, mode,
+		(mode == 8) ? ", prime thread " : "", (mode == 8) ? F7PrimeThreadName(*who) : "");
+	return mode;
+}
+
+/// Mode 8. Returns false, and the caller places as mode 7, when cpu_capacity cannot be read or
+/// the tier without the prime core has fewer processors than threads left to put on it.
+static bool F7PlacePrimeThread(F7PrimeThread who, bool mtvu)
+{
+	// Ranked by cpu_capacity alone: it is what EAS ranks by, and the source the tier mask
+	// (GetPerformanceCoresMask) is built from on this device.
+	u32 prime = 0;
+	u32 prime_capacity = 0;
+	SmallString capacities;
+	const u32 count = cpuinfo_get_processors_count();
+	for (u32 i = 0; i < count; i++)
+	{
+		const cpuinfo_processor* proc = cpuinfo_get_processor(i);
+		if (!proc || proc->smt_id != 0)
+			continue;
+
+		const u32 id = GetProcessorIdForProcessor(proc);
+		const u32 capacity = ReadCpuSysfsU32(id, "cpu_capacity");
+		capacities.append_format(" {}:{}", id, capacity);
+		// Ties go to the higher-numbered core: on Android SoCs the prime core is the last one.
+		if (capacity != 0 && capacity >= prime_capacity)
+		{
+			prime = id;
+			prime_capacity = capacity;
+		}
+	}
+
+	const u64 tier = GetPerformanceCoresMask();
+	if (prime_capacity == 0 || tier == 0 || prime >= 64)
+	{
+		INFO_LOG("F7AFF: cpu_capacity unreadable or no performance tier (tier 0x{:x}, capacities:{}); "
+				 "placing as mode 7.",
+			tier, capacities.view());
+		return false;
+	}
+
+	const u64 prime_mask = static_cast<u64>(1) << prime;
+	const u64 rest_mask = tier & ~prime_mask;
+
+	// With MTVU off the VU1 programs run on the EE thread, and GS Back only exists with GS
+	// multi-threading on; without it the MTGS thread does all of the GS work.
+	F7PrimeThread target = who;
+	if (target == F7PrimeThread::VU && !mtvu)
+		target = F7PrimeThread::EE;
+	const bool gs_back = GSHasFrontParser();
+	if (target == F7PrimeThread::GSBack && !gs_back)
+		target = F7PrimeThread::GS;
+
+	// EE, GS, VU (MTVU on) and GS Back (when it runs), minus the one on the prime core.
+	const u32 others = 1u + (mtvu ? 1u : 0u) + (gs_back ? 1u : 0u);
+	if (static_cast<u32>(std::popcount(rest_mask)) < others)
+	{
+		INFO_LOG("F7AFF: tier 0x{:x} without cpu{} leaves {} processors for {} threads; placing as mode 7.",
+			tier, prime, std::popcount(rest_mask), others);
+		return false;
+	}
+
+	const auto mask_for = [&](F7PrimeThread thread) { return (thread == target) ? prime_mask : rest_mask; };
+	const u64 ee_mask = mask_for(F7PrimeThread::EE);
+	const u64 gs_mask = mask_for(F7PrimeThread::GS);
+	const u64 vu_mask = mtvu ? mask_for(F7PrimeThread::VU) : 0;
+	const u64 gs_back_mask = mask_for(F7PrimeThread::GSBack);
+	s_vm_thread_handle.SetAffinity(ee_mask);
+	MTGS::GetThreadHandle().SetAffinity(gs_mask);
+	vu1Thread.GetThreadHandle().SetAffinity(vu_mask);
+	// Set even with GS multi-threading off: the mask only applies once a back thread registers.
+	SetGSBackThreadAffinityLocked(gs_back_mask);
+	s_thread_affinities_set = true;
+	// Helper threads (the Oboe audio callback) stay off the prime core too.
+	s_perf_cluster_mask.store(rest_mask, std::memory_order_relaxed);
+
+	INFO_LOG("F7AFF: mode 8: prime cpu{} (cpu_capacity {}) -> {}{}; masks EE 0x{:x} GS 0x{:x} VU 0x{:x} "
+			 "GSBack 0x{:x}; tier 0x{:x}, mtvu={}, gs_back_thread={}; capacities:{}",
+		prime, prime_capacity, F7PrimeThreadName(target), (target != who) ? " (requested thread not running)" : "",
+		ee_mask, gs_mask, vu_mask, gs_back_mask, tier, mtvu ? 1 : 0, gs_back ? 1 : 0, capacities.view());
+	return true;
+}
 #endif
 
 void VMManager::SetEmuThreadAffinities()
@@ -4820,7 +4972,12 @@ void VMManager::SetEmuThreadAffinities()
 	// emu threads to the big/prime TIER and lets EAS keep placing them within it, so VU can
 	// still float to the prime. It never selects fewer processors than there are threads to
 	// place, and falls back to fully unpinned when it cannot resolve the tier at all.
-	if (g_android_affinity_mode == 0)
+	//
+	// Poco F7 fork (P2): mode 8 = mode 7 plus one thread alone on the prime core. The property
+	// debug.armsx2.f7.prime promotes the default mode 7 to it (F7ResolveAffinityMode above).
+	F7PrimeThread f7_prime = F7PrimeThread::GSBack;
+	const int affinity_mode = F7ResolveAffinityMode(g_android_affinity_mode, &f7_prime);
+	if (affinity_mode == 0)
 	{
 		MTGS::GetThreadHandle().SetAffinity(0);
 		vu1Thread.GetThreadHandle().SetAffinity(0);
@@ -4848,10 +5005,14 @@ void VMManager::SetEmuThreadAffinities()
 
 	const bool android_mtvu = EmuConfig.Speedhacks.vuThread;
 
+	// Poco F7 fork (P2): mode 8, with mode 7 below as its fallback.
+	if (affinity_mode == 8 && F7PlacePrimeThread(f7_prime, android_mtvu))
+		return;
+
 	// Mode 7 = "Performance Cores": don't hand out individual cores at all, just confine the
 	// emu threads to the big/prime tier and let EAS place them within it. This is the safest
 	// of the pinning modes because it never pins VU to a specific mid-tier core.
-	if (g_android_affinity_mode == 7)
+	if (affinity_mode == 7 || affinity_mode == 8)
 	{
 		const u64 perf_mask = GetPerformanceCoresMask();
 		// Confining N busy threads to fewer than N processors is strictly worse than leaving
@@ -4902,7 +5063,7 @@ void VMManager::SetEmuThreadAffinities()
 	static constexpr int kAffinityRanks[6][3] = {
 		{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {2, 0, 1}, {1, 2, 0}, {2, 1, 0},
 	};
-	const int mode_row = std::clamp(g_android_affinity_mode, 1, 6) - 1;
+	const int mode_row = std::clamp(affinity_mode, 1, 6) - 1;
 	int ee_rank = kAffinityRanks[mode_row][0];
 	int vu_rank = kAffinityRanks[mode_row][1];
 	int gs_rank = kAffinityRanks[mode_row][2];
@@ -4923,7 +5084,7 @@ void VMManager::SetEmuThreadAffinities()
 	const u64 android_ee_affinity = affinity_for_rank(ee_rank);
 	const u64 android_gs_affinity = affinity_for_rank(gs_rank);
 	INFO_LOG("Affinity mode {}: EE rank {} (0x{:x}), VU rank {}, GS rank {} (0x{:x}), mtvu={}",
-		g_android_affinity_mode, ee_rank, android_ee_affinity, vu_rank, gs_rank,
+		affinity_mode, ee_rank, android_ee_affinity, vu_rank, gs_rank,
 		android_gs_affinity, android_mtvu ? 1 : 0);
 
 	s_vm_thread_handle.SetAffinity(android_ee_affinity);
