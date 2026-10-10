@@ -20,6 +20,7 @@
 #endif
 #include "Host.h"
 #include "PerformanceMetrics.h"
+#include "F7Fork.h"
 #include "common/HostSys.h" // GetCPUTicks — present-cap pacer
 #include "pcsx2/Config.h"
 #include "VMManager.h"
@@ -909,7 +910,7 @@ void GSRenderer::SubmitVsync(u32 field, bool registers_written)
 	// VSYNC is never queued: present runs on the MTGS thread behind a drain, so
 	// the back thread stays off the GSDevice on present paths entirely (which
 	// is also what keeps SW + GL-present devices legal in queued modes).
-	DrainBackQueue();
+	DrainBackQueue(F7Prof::Drain::Vsync);
 
 	GSBackQueue::VsyncRecord rec;
 	rec.field = field;
@@ -917,7 +918,11 @@ void GSRenderer::SubmitVsync(u32 field, bool registers_written)
 	// Compares this object's draw and transfer serials with the last frame's. The back thread
 	// advances them as it executes records, so this has to follow the drain.
 	rec.idle_frame = IsIdleFrame();
+
+	// F7 fork (P1): the vsync body on the front (Merge, present, OSD, perf metrics).
+	const u64 f7_t0 = F7Prof::Now();
 	ExecVsyncRecord(rec);
+	F7Prof::g_front.vsync_body.Add(F7Prof::Now() - f7_t0);
 }
 
 void GSRenderer::ExecVsyncRecord(const GSBackQueue::VsyncRecord& rec)

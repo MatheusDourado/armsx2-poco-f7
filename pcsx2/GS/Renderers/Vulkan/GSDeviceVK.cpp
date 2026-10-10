@@ -55,6 +55,7 @@ namespace
 
 #include "BuildVersion.h"
 #include "Config.h"
+#include "F7Fork.h"
 #include "Host.h"
 #include "ShaderCacheVersion.h"
 #include "ImGui/ImGuiManager.h"
@@ -1920,7 +1921,9 @@ void GSDeviceVK::ReportDeviceFault()
 void GSDeviceVK::WaitForCommandBufferCompletion(u32 index)
 {
 	// Wait for this command buffer to be completed.
+	const u64 f7_t0 = F7Prof::Now(); // F7 fork (P1): GPU waits of the MTGS / GS Back threads
 	const VkResult res = vkWaitForFences(m_device, 1, &m_frame_resources[index].fence, VK_TRUE, UINT64_MAX);
+	F7Prof::AddGpuWait(F7Prof::Now() - f7_t0);
 	if (res != VK_SUCCESS)
 	{
 		LOG_VULKAN_ERROR(res, "vkWaitForFences failed: ");
@@ -2246,8 +2249,10 @@ void GSDeviceVK::ExecuteCommandBuffer(WaitType wait_for_completion)
 			CalibrateSpinTimestamp();
 		if (wait_for_completion == WaitType::Spin)
 		{
+			const u64 f7_t0 = F7Prof::Now(); // F7 fork (P1): the spin is a GPU wait too
 			while (vkGetFenceStatus(m_device, m_frame_resources[current_frame].fence) == VK_NOT_READY)
 				ShortSpin();
+			F7Prof::AddGpuWait(F7Prof::Now() - f7_t0);
 		}
 		WaitForCommandBufferCompletion(current_frame);
 	}
@@ -2756,7 +2761,9 @@ void GSDeviceVK::WaitForSpinCompletion(u32 index)
 	if (!resources.in_progress)
 		return;
 
+	const u64 f7_t0 = F7Prof::Now(); // F7 fork (P1)
 	const VkResult res = vkWaitForFences(m_device, 1, &resources.fence, VK_TRUE, UINT64_MAX);
+	F7Prof::AddGpuWait(F7Prof::Now() - f7_t0);
 	if (res != VK_SUCCESS)
 	{
 		LOG_VULKAN_ERROR(res, "vkWaitForFences failed: ");

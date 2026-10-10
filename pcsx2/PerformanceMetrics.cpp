@@ -13,10 +13,14 @@
 
 #include "PerformanceMetrics.h"
 
+#include "F7Fork.h"
 #include "GS.h"
 #include "MTGS.h"
 #include "MTVU.h"
 #include "VMManager.h"
+
+#include <algorithm>
+#include <atomic>
 
 #if defined(__ANDROID__)
 #include <algorithm>
@@ -217,6 +221,202 @@ static double s_average_gpu_ps_invocations = 0.0;
 static u64 s_accumulated_gpu_vs_invocations = 0;
 static u64 s_accumulated_gpu_ps_invocations = 0;
 
+// ---- Poco F7 fork (P1): the F7PROF line ----------------------------------------------------------
+// Every ~5 s of emulation, at the 0.5 s metric update on the MTGS thread, one console line (so it
+// reaches logcat) splits the wall time of the GS front (MTGS) and GS Back threads into waits and
+// the rest. The counters live in F7Fork.h; every window state below is touched only on the MTGS
+// thread, except the rebase flag, which Reset() raises from the CPU thread.
+static constexpr double F7PROF_INTERVAL = 5.0;
+
+struct F7ProfPair
+{
+	u64 ticks = 0;
+	u64 count = 0;
+};
+
+struct F7ProfSample
+{
+	F7ProfPair vu;
+	u64 vu_packets = 0;
+	F7ProfPair drain[static_cast<size_t>(F7Prof::Drain::Count)];
+	F7ProfPair full[static_cast<size_t>(F7Prof::Full::Count)];
+	F7ProfPair idle;
+	F7ProfPair vsync_body;
+	F7ProfPair gpu;
+	F7ProfPair back_idle;
+	F7ProfPair back_gpu;
+	u64 back_records = 0;
+};
+
+static std::atomic<bool> s_f7_rebase{true};
+static bool s_f7_legend_logged = false;
+static F7ProfSample s_f7_base;
+static double s_f7_time = 0.0;
+static u32 s_f7_frames = 0;
+static u64 s_f7_cpu_ee = 0;
+static u64 s_f7_cpu_gs = 0;
+static u64 s_f7_cpu_gsb = 0;
+static u64 s_f7_cpu_vu = 0;
+
+static F7ProfPair F7ProfRead(const F7Prof::Counter& counter)
+{
+	F7ProfPair pair;
+	pair.ticks = counter.ticks.load(std::memory_order_relaxed);
+	pair.count = counter.count.load(std::memory_order_relaxed);
+	return pair;
+}
+
+static F7ProfSample F7ProfTake()
+{
+	F7ProfSample s;
+	s.vu = F7ProfRead(F7Prof::g_front.vu);
+	s.vu_packets = F7Prof::g_front.vu_packets.load(std::memory_order_relaxed);
+	for (size_t i = 0; i < static_cast<size_t>(F7Prof::Drain::Count); i++)
+		s.drain[i] = F7ProfRead(F7Prof::g_front.drain[i]);
+	for (size_t i = 0; i < static_cast<size_t>(F7Prof::Full::Count); i++)
+		s.full[i] = F7ProfRead(F7Prof::g_front.full[i]);
+	s.idle = F7ProfRead(F7Prof::g_front.idle);
+	s.vsync_body = F7ProfRead(F7Prof::g_front.vsync_body);
+	s.gpu = F7ProfRead(F7Prof::g_front.gpu);
+	s.back_idle = F7ProfRead(F7Prof::g_back.idle);
+	s.back_gpu = F7ProfRead(F7Prof::g_back.gpu);
+	s.back_records = F7Prof::g_back.records.load(std::memory_order_relaxed);
+	return s;
+}
+
+static void F7ProfResetWindow(const F7ProfSample& base)
+{
+	s_f7_base = base;
+	s_f7_time = 0.0;
+	s_f7_frames = 0;
+	s_f7_cpu_ee = 0;
+	s_f7_cpu_gs = 0;
+	s_f7_cpu_gsb = 0;
+	s_f7_cpu_vu = 0;
+}
+
+static void F7ProfLogWindow(const F7ProfSample& now)
+{
+	const F7ProfSample& base = s_f7_base;
+	const double frames = static_cast<double>(s_f7_frames);
+	const double tick_ms = 1000.0 / static_cast<double>(GetTickFrequency());
+	const double thread_ms = 1000.0 / static_cast<double>(Threading::GetThreadTicksPerSecond());
+
+	// Everything per emulated field (vsync): ms per field, and events per field.
+	const auto ms = [&](const F7ProfPair& n, const F7ProfPair& b) {
+		return static_cast<double>(n.ticks - b.ticks) * tick_ms / frames;
+	};
+	const auto per = [&](u64 n, u64 b) { return static_cast<double>(n - b) / frames; };
+	const auto cpu = [&](u64 thread_ticks) { return static_cast<double>(thread_ticks) * thread_ms / frames; };
+
+	const double wall = s_f7_time * 1000.0 / frames;
+
+	double drain_ms[static_cast<size_t>(F7Prof::Drain::Count)];
+	double drain_n[static_cast<size_t>(F7Prof::Drain::Count)];
+	double drain_total_ms = 0.0, drain_total_n = 0.0;
+	for (size_t i = 0; i < static_cast<size_t>(F7Prof::Drain::Count); i++)
+	{
+		drain_ms[i] = ms(now.drain[i], base.drain[i]);
+		drain_n[i] = per(now.drain[i].count, base.drain[i].count);
+		drain_total_ms += drain_ms[i];
+		drain_total_n += drain_n[i];
+	}
+
+	double full_ms[static_cast<size_t>(F7Prof::Full::Count)];
+	double full_total_ms = 0.0, full_total_n = 0.0;
+	for (size_t i = 0; i < static_cast<size_t>(F7Prof::Full::Count); i++)
+	{
+		full_ms[i] = ms(now.full[i], base.full[i]);
+		full_total_ms += full_ms[i];
+		full_total_n += per(now.full[i].count, base.full[i].count);
+	}
+
+	const double vu_ms = ms(now.vu, base.vu);
+	const double gpu_ms = ms(now.gpu, base.gpu);
+	const double idle_ms = ms(now.idle, base.idle);
+	const double front_rest = std::max(0.0, wall - (vu_ms + drain_total_ms + full_total_ms + gpu_ms + idle_ms));
+
+	constexpr size_t OTHER = static_cast<size_t>(F7Prof::Drain::Other);
+	constexpr size_t VSYNC = static_cast<size_t>(F7Prof::Drain::Vsync);
+	constexpr size_t FIFO = static_cast<size_t>(F7Prof::Drain::Fifo);
+	constexpr size_t AA1 = static_cast<size_t>(F7Prof::Drain::AA1);
+	constexpr size_t MOVE = static_cast<size_t>(F7Prof::Drain::Move);
+
+	char line[768];
+	int len = std::snprintf(line, sizeof(line),
+		"F7PROF %.1fs %uf %.1fvps | GS vu %.2f/%.1f(%.1fpk) drn %.2f/%.1f(vs %.2f/%.1f rb %.2f/%.1f "
+		"aa %.2f/%.1f mv %.2f/%.1f ot %.2f/%.1f) full %.2f/%.1f(r %.2f d %.2f p %.2f) gpu %.2f/%.1f "
+		"idle %.2f rest %.2f vsb %.2f cpu %.2f",
+		s_f7_time, s_f7_frames, frames / s_f7_time,
+		vu_ms, per(now.vu.count, base.vu.count), per(now.vu_packets, base.vu_packets),
+		drain_total_ms, drain_total_n,
+		drain_ms[VSYNC], drain_n[VSYNC], drain_ms[FIFO], drain_n[FIFO],
+		drain_ms[AA1], drain_n[AA1], drain_ms[MOVE], drain_n[MOVE], drain_ms[OTHER], drain_n[OTHER],
+		full_total_ms, full_total_n,
+		full_ms[static_cast<size_t>(F7Prof::Full::Ring)], full_ms[static_cast<size_t>(F7Prof::Full::DrawPool)],
+		full_ms[static_cast<size_t>(F7Prof::Full::PayloadPool)],
+		gpu_ms, per(now.gpu.count, base.gpu.count),
+		idle_ms, front_rest, ms(now.vsync_body, base.vsync_body), cpu(s_f7_cpu_gs));
+	len = std::clamp(len, 0, static_cast<int>(sizeof(line)) - 1);
+
+	if (PerformanceMetrics::HasGSBackThread())
+	{
+		const double back_idle = ms(now.back_idle, base.back_idle);
+		const double back_gpu = ms(now.back_gpu, base.back_gpu);
+		len += std::snprintf(line + len, sizeof(line) - static_cast<size_t>(len),
+			" | GSB idle %.2f gpu %.2f/%.1f rest %.2f cpu %.2f rec %.0f",
+			back_idle, back_gpu, per(now.back_gpu.count, base.back_gpu.count),
+			std::max(0.0, wall - back_idle - back_gpu), cpu(s_f7_cpu_gsb),
+			per(now.back_records, base.back_records));
+	}
+	else
+	{
+		len += std::snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " | GSB off");
+	}
+	len = std::clamp(len, 0, static_cast<int>(sizeof(line)) - 1);
+
+	std::snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " | EE %.2f VU %.2f",
+		cpu(s_f7_cpu_ee), cpu(s_f7_cpu_vu));
+
+	if (!s_f7_legend_logged)
+	{
+		s_f7_legend_logged = true;
+		Console.WriteLn("F7PROF legend: per emulated field (vsync); a/b = ms/count per field. GS = MTGS front: "
+						"vu = wait on MTVU (pk = VU1 packets), drn = back-queue drains (vs vsync, rb FIFO "
+						"readback, aa AA1, mv move hook, ot other), full = ring/pool backpressure (r ring, "
+						"d draw pool, p payload pool).");
+		Console.WriteLn("F7PROF legend: gpu = vkWaitForFences, idle = waiting for EE, rest = wall - (vu+drn+full+"
+						"gpu+idle), vsb = vsync body (Merge/present/OSD), cpu = thread CPU. GSB = GS Back: idle = "
+						"waiting for records, rest = wall - idle - gpu, rec = records. EE/VU = thread CPU ms.");
+	}
+	Console.WriteLn("%s", line);
+}
+
+/// Called at every 0.5 s metric update, on the MTGS thread, with that update's window.
+static void F7ProfOnUpdate(double time, u32 frames, u64 cpu_ee, u64 cpu_gs, u64 cpu_gsb, u64 cpu_vu)
+{
+	// (Re)start the window: at boot and after Reset() (resume from pause, fast-boot end) the
+	// counters kept running while the update window did not, so that stretch is dropped.
+	if (s_f7_rebase.exchange(false, std::memory_order_acq_rel))
+	{
+		F7ProfResetWindow(F7ProfTake());
+		return;
+	}
+
+	s_f7_time += time;
+	s_f7_frames += frames;
+	s_f7_cpu_ee += cpu_ee;
+	s_f7_cpu_gs += cpu_gs;
+	s_f7_cpu_gsb += cpu_gsb;
+	s_f7_cpu_vu += cpu_vu;
+	if (s_f7_time < F7PROF_INTERVAL || s_f7_frames == 0)
+		return;
+
+	const F7ProfSample now = F7ProfTake();
+	F7ProfLogWindow(now);
+	F7ProfResetWindow(now);
+}
+
 void PerformanceMetrics::Clear()
 {
 	Reset();
@@ -286,6 +486,9 @@ void PerformanceMetrics::Reset()
 
 	for (GSSWThreadStats& stat : s_gs_sw_threads)
 		stat.last_cpu_time = stat.handle.GetCPUTime();
+
+	// F7 fork (P1): the MTGS thread restarts its F7PROF window at its next update.
+	s_f7_rebase.store(true, std::memory_order_release);
 }
 
 void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_skipping_present)
@@ -385,6 +588,9 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 		thread.usage = static_cast<double>(delta) * pct_divider;
 		thread.time = static_cast<double>(delta) * time_divider;
 	}
+
+	// F7 fork (P1): feed this update's window to the F7PROF line.
+	F7ProfOnUpdate(time, s_frames_since_last_update, cpu_delta, gs_delta, gs_back_delta, vu_delta);
 
 	// Rolling perf log (uses this window's frame count before it resets).
 	s_log_accum_time += time;

@@ -16,6 +16,7 @@
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/GSVector.h"
 #include "GSAlignedClass.h"
+#include "F7Fork.h"
 
 #include "common/Threading.h"
 
@@ -58,7 +59,8 @@ public:
 	// GV7-2: external sync points (settings apply, screenshot-to-memory) that
 	// touch renderer/device state from the MTGS thread must drain queued records
 	// first — the back thread may otherwise be mid-draw on the same GSDevice.
-	void DrainBackQueue();
+	// F7 fork (P1): `why` only labels the wait for the F7PROF counters.
+	void DrainBackQueue(F7Prof::Drain why = F7Prof::Drain::Other);
 
 	/// Stops the back thread after draining it. Called by GS.cpp when the split cannot engage
 	/// after all; with no front object the renderer then parses and draws single-threaded.
@@ -960,9 +962,11 @@ public:
 				break;
 			}
 			// Ring full: sleep until the back has retired a batch.
+			const u64 f7_t0 = F7Prof::Now(); // F7 fork (P1): backpressure wait
 			m_chan->space.Wait([this]() {
 				return GSBackQueue::RecordRing::Capacity() - m_chan->ring.Size() >= GSBackQueue::Channel::kRingRefill;
 			});
+			F7Prof::AddFull(F7Prof::Full::Ring, F7Prof::Now() - f7_t0);
 		}
 	}
 

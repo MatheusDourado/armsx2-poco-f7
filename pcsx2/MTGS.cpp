@@ -3,6 +3,7 @@
 
 #include "GS.h"
 #include "Gif_Unit.h"
+#include "F7Fork.h"
 #include "MTGS.h"
 #include "MTVU.h"
 #include "Host.h"
@@ -147,6 +148,7 @@ void MTGS::ThreadEntryPoint()
 {
 	Threading::SetNameOfCurrentThread("GS");
 	PerformanceMetrics::AdpfRegisterCallingThread(); // ADPF: hint the GS thread's core (Android)
+	F7Prof::BindGpuCounter(&F7Prof::g_front.gpu); // F7 fork (P1): GPU fence waits on this thread
 
 	// GS can hit SMC write traps when executing InitAndReadFIFO
 	// As racey as it sounds, it should be safe, since InitAndReadFIFO is requested and immediately waited for,
@@ -353,9 +355,12 @@ void MTGS::MainLoop()
 		}
 		else
 		{
+			// F7 fork (P1): the front's idle time, i.e. waiting for the EE to queue work.
+			const u64 f7_t0 = F7Prof::Now();
 			mtvu_lock.unlock();
 			s_sem_event.WaitForWork();
 			mtvu_lock.lock();
+			F7Prof::g_front.idle.Add(F7Prof::Now() - f7_t0);
 		}
 
 		if (!s_open_flag.load(std::memory_order_acquire))
@@ -479,12 +484,16 @@ void MTGS::MainLoop()
 				case Command::MTVUGSPacket:
 				{
 					MTVU_LOG("MTGS - Waiting on semaXGkick!");
+					F7Prof::Bump(F7Prof::g_front.vu_packets); // F7 fork (P1)
 					if (!vu1Thread.semaXGkick.TryWait())
 					{
+						// F7 fork (P1): wall time the front spends waiting on VU1, spin included.
+						const u64 f7_t0 = F7Prof::Now();
 						mtvu_lock.unlock();
 						// Wait for MTVU to complete vu1 program
 						vu1Thread.semaXGkick.WaitWithSpin();
 						mtvu_lock.lock();
+						F7Prof::g_front.vu.Add(F7Prof::Now() - f7_t0);
 					}
 					Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
 					GS_Packet gsPack = path.GetGSPacketMTVU(); // Get vu1 program's xgkick packet(s)

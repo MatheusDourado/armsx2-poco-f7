@@ -386,7 +386,7 @@ bool GSFrontState::IsCoverageAlphaSupported()
 	const u64 alpha = m_context->ALPHA.U64;
 	if (s_n != m_cov_epoch || alpha != m_cov_alpha)
 	{
-		DrainBackQueue();
+		DrainBackQueue(F7Prof::Drain::AA1);
 		m_cov_epoch = s_n;
 		m_cov_alpha = alpha;
 
@@ -740,9 +740,11 @@ GSBackQueue::DrawNode* GSState::AcquireDrawNode()
 		if (m_chan->draw_arena.size() < GSBackQueue::Channel::kMaxDrawNodes)
 			break;
 
+		const u64 f7_t0 = F7Prof::Now(); // F7 fork (P1): backpressure wait
 		m_chan->space.Wait([this]() {
 			return m_chan->draw_free.Size() >= GSBackQueue::Channel::kDrawRefill;
 		});
+		F7Prof::AddFull(F7Prof::Full::DrawPool, F7Prof::Now() - f7_t0);
 	}
 
 	// Fresh node, arrays sized like the buffer they're about to replace
@@ -793,9 +795,11 @@ GSBackQueue::PayloadNode* GSState::AcquirePayloadNode()
 		if (m_chan->payload_arena.size() < GSBackQueue::Channel::kMaxPayloadNodes)
 			break;
 
+		const u64 f7_t0 = F7Prof::Now(); // F7 fork (P1): backpressure wait
 		m_chan->space.Wait([this]() {
 			return m_chan->payload_free.Size() >= GSBackQueue::Channel::kPayloadRefill;
 		});
+		F7Prof::AddFull(F7Prof::Full::PayloadPool, F7Prof::Now() - f7_t0);
 	}
 
 	constexpr size_t alloc_size = 1024 * 1024 * 4; // = GSTransferBuffer's buffer
@@ -864,7 +868,7 @@ void GSState::StopBackThread()
 	m_chan->consumer_running = false;
 }
 
-void GSState::DrainBackQueue()
+void GSState::DrainBackQueue(F7Prof::Drain why)
 {
 	// Keyed on the channel, not this object's producer flag, so drains work
 	// from either side of the two-object split.
@@ -878,7 +882,11 @@ void GSState::DrainBackQueue()
 	pxAssertMsg(std::this_thread::get_id() == m_chan->drain_thread,
 		"GS back queue drained off the MTGS thread (single empty-waiter channel)");
 
+	// F7 fork (P1): every drain that reaches the wait is counted, also the ones that find the
+	// queue already empty, so the count is "drain points hit" and the time is what they cost.
+	const u64 f7_t0 = F7Prof::Now();
 	m_chan->sema.WaitForEmpty();
+	F7Prof::AddDrain(why, F7Prof::Now() - f7_t0);
 }
 
 void GSState::BackThreadLoop()
@@ -891,6 +899,7 @@ void GSState::BackThreadLoop()
 	// registration applies that placement now, including replacing the MTGS thread's mask this
 	// thread inherited, which may be a single core and would re-serialize the split.
 	const u64 placed = VMManager::Internal::RegisterGSBackThread(&handle);
+	F7Prof::BindGpuCounter(&F7Prof::g_back.gpu); // F7 fork (P1): GPU fence waits on this thread
 #if defined(__linux__)
 	Console.WriteLn("GS: back thread starts on CPU mask 0x%llx (0 = any; re-placed when thread affinities are applied); first ran on CPU %d.",
 		static_cast<unsigned long long>(placed), sched_getcpu());
@@ -905,17 +914,23 @@ void GSState::BackThreadLoop()
 
 	for (;;)
 	{
+		// F7 fork (P1): the back's idle time (starved of records), spin included.
+		const u64 f7_t0 = F7Prof::Now();
 		m_chan->sema.WaitForWorkWithSpin();
+		F7Prof::g_back.idle.Add(F7Prof::Now() - f7_t0);
 
 		if (m_back_thread_exit.load(std::memory_order_acquire))
 			break;
 
+		u64 f7_records = 0;
 		while (GSBackQueue::RecordSlot* slot = m_chan->ring.Peek())
 		{
 			ExecRecordSlot(*slot);
 			m_chan->ring.Pop();
 			m_chan->space.NotifyRetired([this]() { return m_chan->ring.Size(); });
+			f7_records++;
 		}
+		F7Prof::Bump(F7Prof::g_back.records, f7_records);
 		m_chan->space.NotifyIdle();
 	}
 
@@ -4623,7 +4638,7 @@ void GSState::Write(const u8* mem, int len)
 
 void GSState::InitReadFIFO(u8* mem, int len)
 {
-	DrainBackQueue();
+	DrainBackQueue(F7Prof::Drain::Fifo);
 
 	// No size or already a transfer in progress.
 	if (len <= 0 || m_tr.total != 0)
@@ -4648,7 +4663,7 @@ void GSState::InitReadFIFO(u8* mem, int len)
 
 	// CheckWriteOverlap above may have flushed pending draws into records;
 	// they must land in local memory before the TC readback and image read.
-	DrainBackQueue();
+	DrainBackQueue(F7Prof::Drain::Fifo);
 
 	if (m_tr.x == sx && m_tr.y == sy)
 		m_mem_target->InvalidateLocalMem(m_env.BITBLTBUF, r);
@@ -4670,7 +4685,7 @@ void GSState::InitReadFIFO(u8* mem, int len)
 // NOTE: called from outside MTGS
 void GSState::Read(u8* mem, int len)
 {
-	DrainBackQueue();
+	DrainBackQueue(F7Prof::Drain::Fifo);
 
 	if (len <= 0 || m_tr.total == 0)
 		return;
@@ -4734,7 +4749,7 @@ void GSState::SubmitMove()
 	{
 		if (m_mem_target->HasMoveHook())
 		{
-			DrainBackQueue();
+			DrainBackQueue(F7Prof::Drain::Move);
 			m_env.TRXDIR.XDIR = m_mem_target->m_env.TRXDIR.XDIR;
 		}
 		else
